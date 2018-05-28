@@ -1,0 +1,627 @@
+/**
+ *  Mode Automation
+ *
+ *  Copyright 2014 craig Lyons
+ *
+ *  I do not authorize this code, in whole or subsections, to be used within any application that will later be sold or distrubuted before, after, or during
+ *  an exchanging of money.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ *
+ */
+ 
+definition(
+    name: "Mode Automation",
+    namespace: "",
+    author: "craig Lyons",
+    description: "This application monitors movement within the house and automatically switches modes depending on what's going on",
+    category: "My Apps",
+    iconUrl: "http://cdn.appato.com/nullriver-inc/haiku-home-automation-for-hai/icon/256.png",
+    iconX2Url: "http://cdn.appato.com/nullriver-inc/haiku-home-automation-for-hai/icon/256.png",
+    iconX3Url: "http://cdn.appato.com/nullriver-inc/haiku-home-automation-for-hai/icon/256.png"
+)
+
+
+preferences {
+	page(name: "selectPhrases")
+    
+    page( name:"Settings", title:"Settings", uninstall:true, install:true ) 
+    {
+   		section("Warning")
+            {
+            	input "warningTimer"  , "number", title: "Minutes until warning Light goes on?"
+                input "hues", "capability.colorControl", title: "Which Hue Bulbs?", required:true
+                input "color", "enum", title: "Hue Color?", required: false, multiple:false, options: [
+					"On - Custom Color",
+                    "Soft White",
+					"White",
+					"Daylight",
+					"Warm White",
+					"Red","Green","Blue","Yellow","Orange","Purple","Pink"]
+				input "lightLevel", "enum", title: "Light Level?", required: true, options: ["10","20","30","40","50","60","70","80","90","100"]
+			} 
+    }
+}
+
+
+def selectPhrases() {
+	dynamicPage(name: "selectPhrases", title: "Configure", nextPage:"Settings", uninstall: true) 
+    {
+
+        def phrases = location.helloHome?.getPhrases()*.label
+        if (phrases) 
+        {
+            phrases.sort()
+            
+            section("Morning") 
+            {
+                input "morningPhrase", "enum", title: "Morning Phrase?", required: true, options: phrases, refreshAfterSelection:true
+                input "morningMode", "mode", title: "Morning Mode?", required: true
+                input "morningTime", "time", title: "Morning Time?", required: true
+            }
+            section("Home") 
+            {
+                input "homePhrase", "enum", title: "Home Phrase?", required: true, options: phrases, refreshAfterSelection:true
+                input "homeMode", "mode", title: "Home Mode?", required: true
+                input "homeTime", "time", title: "Home Time?", required: true
+                input "homeMotion" , "capability.motionSensor", title: "Home Motion?", multiple: true
+            }
+            section("Working From Home") 
+            {
+                input "wfhPhrase", "enum", title: "WFH Phrase?", required: true, options: phrases, refreshAfterSelection:true
+                input "wfhMode", "mode", title: "WFH Mode?", required: true
+                input "wfhStartTime", "time", title: "What time do you start WFH?", required: true
+                input "wfhEndTime", "time", title: "What time do you end WFH?", required: true
+                input "wfhTimer"  , "number", title: "Minutes until no longer WFH?"
+                input "wfhMotion" , "capability.motionSensor", title: "wfh Motion?", multiple: true
+            }
+            section("One Awake") 
+            {
+                input "oneUpPhrase", "enum", title: "One Awake Phrase?", required: true, options: phrases, refreshAfterSelection:true
+                input "oneUpMode", "mode", title: "One Awake Mode?", required: true
+                input "bedroomDoor", "capability.contactSensor", title: "Bedroom Door?"
+            }
+            section("Night") 
+            {
+                input "nightPhrase", "enum", title: "Night Phrase?", required: true, options: phrases, refreshAfterSelection:true
+                input "nightMode", "mode", title: "Night Mode?", required: true
+                input "nightTime", "time", title: "Night Time?", required: true
+                input "nightTimer", "number", title: "Minutes Until Good Night?"
+                input "nightMotion", "capability.motionSensor", title: "Night Motion?", multiple: true
+            }
+            section("Away")
+            {
+            	input "awayTimer" , "number", title: "Minutes until away mode is set?"
+                input "awayMode", "mode", title: "Away Mode?", required: true
+                input "awayPhrase", "enum", title: "Away Phrase?", required: true, options: phrases, refreshAfterSelection:true
+            }
+            
+            
+        }
+	}
+}
+def installed() {
+	log.debug "Installed with settings: ${settings}"
+	initialize()
+}
+
+def updated() {
+	log.debug "Updated with settings: ${settings}"
+	unschedule()
+	unsubscribe()
+    initialize()
+    
+}
+
+def initialize() {
+	
+    subscribe(nightMotion, "motion", nightMotionAction)
+    subscribe(homeMotion, "motion", homeMotionAction)
+    subscribe(wfhMotion, "motion", wfhMotionAction)
+    subscribe(bedroomDoor, "contact", bedroomDoorAction)
+    
+    state.wfhMotionStoppedAt = now()
+    state.homeMotionStoppedAt = now()
+    state.nightMotionStoppedAt = now()
+    state.bedroomDoorOpened = now()
+    state.warningLight = false
+    
+    runIn(120, checkMode)
+}
+
+private setMode(cmdMode, cmdPhrase, notification)
+{
+	log.trace "setMode w/Notification"
+    
+    if (location.mode != cmdMode)
+    {
+        log.info "cmdMode: '${cmdMode}', cmdPhrase: '${cmdPhrase}'"
+        location.helloHome.execute(cmdPhrase)
+        //setMode(cmdMode, cmdPhrase)
+        sendNotificationEvent(notification)
+        
+    }
+    else
+    {
+    	log.info "Did not change mode. Mode '$location.mode' already '${cmdMode}'"
+    }
+    
+    
+    
+
+}
+
+private setMode(cmdMode, cmdPhrase)
+{
+	log.trace "setMode"
+    
+    if (location.mode != cmdMode)
+    {
+        log.info "Changing Mode From < $location.mode > to '${cmdMode}' && setting Phrase to '${cmdPhrase}'"
+        location.helloHome.execute(cmdPhrase)
+        //setLocationMode(cmdMode)
+        //sendNotificationEvent("Changing Mode From < $location.mode > to '${cmdMode}' and setting Phrase to '${cmdPhrase}'")
+    }
+    else
+    {
+    	log.info "Did not change mode. Mode '$location.mode' already '${cmdMode}'"
+    }
+}
+
+def checkMode()
+{
+
+	log.trace "checkMode"
+    
+    runIn(120, checkMode)
+    
+    def contactValue = bedroomDoor.latestValue("contact")
+    
+    def homeElapsed    = now() - state.homeMotionStoppedAt
+    def nightElapsed   = now() - state.nightMotionStoppedAt
+    def wfhElapsed     = now() - state.wfhMotionStoppedAt
+    def doorElapsed    = now() - state.bedroomDoorOpened
+    
+    def nightThreshold = (60000 * nightTimer) - 10000
+    def awayThreshold  = (60000 * awayTimer) - 10000
+    def wfhThreshold   = (60000 * wfhTimer) - 10000
+    def doorThreshold  = (60000 * 5) - 10000
+    def warningThreshold = (60000 * warningTimer) - 10000
+    
+    log.info "Elapsed:::: Home '${homeElapsed}', Night '${nightElapsed}', WFH '${wfhElapsed}'"
+    log.info "Threshold:: Away '${awayThreshold}', Night '${nightThreshold}', WFH '${wfhThreshold}'"
+    
+    def minLastMotion = (homeElapsed > nightElapsed) ? nightElapsed : homeElapsed
+	    minLastMotion = minLastMotion / 60000
+    
+    if (location.mode == morningMode)
+    {
+    	
+        log.trace "IN:: morningMode"
+        
+        if (homeElapsed >= awayThreshold && nightElapsed >= awayThreshold)
+    	{
+    		setMode(awayMode, awayPhrase, "Changed to '${awayMode}' because no motion for ${minLastMotion} minutes")
+        } 
+    }
+    
+    else if (location.mode == wfhMode)
+    {
+    	log.trace "IN:: wfhMode"
+        
+        if (wfhElapsed >= wfhThreshold)
+    	{
+    		log.trace "IN:: wfhMode (older than time)"
+            
+            minLastMotion = wfhElapsed / 60000
+            
+            setMode(homeMode, homePhrase, "Changed to '${homeMode}' because no motion in office for ${minLastMotion} minutes")
+        }
+        else
+        {
+        	log.info "WFH Elapsed: ${wfhElapsed} < ${wfhThreshold}"
+        }
+    }
+    
+    else if (location.mode == homeMode)
+    {
+    	log.trace "IN:: homeMode"
+        
+        if (homeElapsed >= awayThreshold && nightElapsed >= awayThreshold)
+    	{
+    		setMode(awayMode, awayPhrase, "Changed to '${awayMode}' because no motion for ${minLastMotion} minutes")
+        }
+    }
+    
+    else if (location.mode == oneUpMode)
+    {
+    	log.trace "IN:: oneUpMode"
+        
+        if(contactValue == "open" && doorElapsed >= doorThreshold)
+        {
+        	log.trace "IN:: Open"
+            minLastMotion = doorElapsed / 60000
+            setMode(homeMode, homePhrase, "Changed to '${homeMode}' because bedroom door has been opened more than ${minLastMotion} minutes")	
+        }
+        else if (homeElapsed >= nightThreshold)
+    	{
+    		log.trace "IN:: oneUpMode"
+            minLastMotion = homeElapsed / 60000
+            setMode(nightMode, nightPhrase, "Changed to '${nightMode}' because no motion for ${minLastMotion} minutes")
+        }
+        else if (homeElapsed >= (nightThreshold - warningThreshold) )
+        {
+    		warningLightOn()    	
+        }
+        else
+        {
+        	def untilBed = (((homeElapsed - nightThreshold + 10000) / 60000).toFloat()).round(1)
+            log.trace "checkMode:: untilNight: ${untilBed}"
+            untilBed = (homeElapsed - (nightThreshold - warningThreshold) + 10000) / 60000
+            log.trace "checkMode:: untilWarningLight: ${(untilBed.toFloat()).round(1)}"
+        }
+    }
+    
+    else if (location.mode == nightMode)
+    {
+    
+    }
+}
+
+def bedroomDoorAction (evt)
+{
+	log.trace "bedroomDoorAction" 
+    log.info "Door ${evt.value}"
+    
+    if (evt.value == "open")
+    {
+        state.bedroomDoorOpened = now()
+    }
+    
+    
+    runIn(120, checkMode)
+
+}
+
+def homeMotionAction (evt)
+{
+	def contactValue = bedroomDoor.latestValue("contact")
+    
+    def timePeriod = "UNK"
+    def wfhPeriod = false
+    
+    def currentTime = now()
+    def mTime = timeToday(morningTime, location.timeZone).time
+    def hTime = timeToday(homeTime, location.timeZone).time
+    def nTime = timeToday(nightTime, location.timeZone).time
+    def wsTime = timeToday(wfhStartTime, location.timeZone).time
+    def weTime = timeToday(wfhEndTime, location.timeZone).time
+	
+    log.trace "homeMotionAction:: motion is now '${evt.value}'"
+    
+    if (currentTime >= mTime && currentTime < hTime)
+    	{ timePeriod = "morning" }
+    else if (currentTime >= hTime && currentTime < nTime)
+    	{ timePeriod = "home" }
+    else if (currentTime >= nTime || currentTime < mTime)
+    	{ timePeriod = "night" }
+        
+    log.trace "homeMotionAction"
+    log.info "timePeriod is ${timePeriod}, warning = '${state.warningLights}'"
+    log.info "'${wsTime}' <= '${currentTime}' <= '${weTime}'"
+    
+    if (currentTime >= wsTime && currentTime < weTime)
+    	{ wfhPeriod = true }
+    
+    
+    log.info"'${location.mode}' != ${wfhMode} || NOT '${wfhPeriod}'"
+    
+    
+    if ((evt.value == "active" || evt.value == "inactive") && (location.mode != wfhMode || !wfhPeriod))
+    {
+        if (timePeriod == "morning")
+        {
+            setMode(morningMode, morningPhrase, "Changed to '${morningMode}' because of motion on '${evt.displayName}' motion sensor")
+        }
+        else if (timePeriod == "home")
+        {
+            setMode(homeMode, homePhrase, "Changed to '${homeMode}' because of motion on '${evt.displayName}' motion sensor")
+        }
+        else if (timePeriod == "night")
+        {
+            if (contactValue == "closed")
+            {
+			    setMode(oneUpMode, oneUpPhrase, "Changed to '${oneUpMode}' because of motion on '${evt.displayName}' motion sensor and bedroom door is closed")	
+            }
+            else if (contactValue == "open")
+            {
+			    def wokeUpMins = 5
+                def wokeUpThreshold = (60000 * wokeUpMins) - 10000
+                def doorElapsed    = now() - state.bedroomDoorOpened
+                
+                if (doorElapsed < wokeUpThreshold && location.mode == oneUpMode)
+                {
+                	log.info "Do Nothing, door has only been open for 5 mins"
+                }
+                else
+                {
+                	setMode(homeMode, homePhrase, "Changed to '${homeMode}' because of motion on '${evt.displayName}' motion sensor and bedroom door is not closed")
+                }
+            }
+            else
+            {
+				log.error "homeMotionAction >> night:: contact value is '${contactValue}'"
+            }
+        }
+        else
+        {
+			log.error "homeMotionAction >> motion:: timePeriod is '${timePeriod}'"
+        }
+    }
+    
+    else if (location.mode == wfhMode)
+    {
+    	log.info "Doing nothing because currently WFH"
+    }
+    else
+    {
+    	log.error "UNKNOWN ACTION: (Top level Else) - motion sensor is '${evt.value}' - location is '${location.mode}' - wfhtime is '${wfhPeriod}'"
+    }
+    
+    
+    state.homeMotionStoppedAt = now()
+    log.trace "homeMotionAction:: homeMotionStoppedAt: '${state.homeMotionStoppedAt}'"
+    runIn(30, checkMode)
+    
+    if (state.warningLights)
+    {
+    	warningLightOff()
+        state.warningLight = false
+    }
+    
+}
+
+def wfhMotionAction (evt)
+{
+	def contactValue = bedroomDoor.latestValue("contact")
+    
+    log.trace "wfhMotionAction"
+    log.info "motion is '${evt.value}', contact is '${contactValue}', Mode is '$location.mode'"
+        
+    def timePeriod = "UNK"
+    def wfhPeriod = false
+    
+	def currentTime = now()
+    def mTime  = timeToday(morningTime, location.timeZone).time
+    def hTime  = timeToday(homeTime, location.timeZone).time
+    def nTime  = timeToday(nightTime, location.timeZone).time
+    def wsTime = timeToday(wfhStartTime, location.timeZone).time
+    def weTime = timeToday(wfhEndTime, location.timeZone).time
+	
+       
+    if (currentTime >= mTime && currentTime < hTime)
+    	{ timePeriod = "morning" }
+    else if (currentTime >= hTime && currentTime < nTime)
+    	{ timePeriod = "home" }
+    else if (currentTime >= nTime || currentTime < mTime)
+    	{ timePeriod = "night" }
+	
+    log.info "currentTime is ${currentTime}, wsTime is ${wsTime}, weTime is ${weTime}"
+    
+    if (currentTime >= wsTime && currentTime < weTime)
+    	{ wfhPeriod = true }
+    
+    log.info "timePeriod is ${timePeriod} and WFH is ${wfhPeriod}"
+    
+    
+    if (evt.value == "active" || evt.value == "inactive")
+    {
+        if (wfhPeriod)
+        {
+        	setMode(wfhMode, wfhPhrase, "Changed to '${wfhMode}' because of motion on '${evt.displayName}' motion sensor")
+        }
+        else if (timePeriod == "morning")
+        {
+            
+        }
+        else if (timePeriod == "home")
+        {
+            
+        }
+        else if (timePeriod == "night")
+        {
+            if (contactValue == "closed")
+            {
+			    
+            }
+            else if (contactValue == "open")
+            {
+			    def wokeUpMins = 5
+                def wokeUpThreshold = (60000 * wokeUpMins) - 10000
+                def doorElapsed    = now() - state.bedroomDoorOpened
+                
+                if (doorElapsed < wokeUpThreshold && location.mode == oneUpMode)
+                {
+                	log.info "Do Nothing, door has only been open for 5 mins"
+                }
+                else
+                {
+                	setMode(homeMode, homePhrase, "Changed to '${homeMode}' because of motion on '${evt.displayName}' motion sensor")
+                }
+            }
+            else
+            {
+				log.error "wfhMotionAction >> night:: contact value is '${contactValue}'"
+            }
+        }
+        else
+        {
+			log.error "wfhMotionAction >> motion:: timePeriod is '${timePeriod}'"
+        }
+    }
+    else
+    {
+    	log.error "wfhMotionAction >>:: motion sensor is '${evt.value}'"
+    }
+    
+    if (evt.value == "inactive")
+    {
+        state.wfhMotionStoppedAt = now()
+        
+    }
+    runIn(30, checkMode)
+}
+
+def nightMotionAction (evt)
+{
+	def contactValue = bedroomDoor.latestValue("contact")
+    log.trace "nightMotionAction"
+    log.info "motion is '${evt.value}', contact is '${contactValue}', Mode is '$location.mode'"
+    
+    def timePeriod = "UNK"
+    
+	def currentTime = now()
+    def mTime = timeToday(morningTime, location.timeZone).time
+    def hTime = timeToday(homeTime, location.timeZone).time
+    def nTime = timeToday(nightTime, location.timeZone).time
+	
+    
+    if (currentTime >= mTime && currentTime < hTime)
+    	{ timePeriod = "morning" }
+    else if (currentTime >= hTime && currentTime < nTime)
+    	{ timePeriod = "home" }
+    else if (currentTime >= nTime || currentTime < mTime)
+    	{ timePeriod = "night" }
+    
+    log.info "timePeriod is ${timePeriod}"
+    
+    
+    if ((evt.value == "active" || evt.value == "inactive") && location.mode != wfhMode)
+    {
+        if (timePeriod == "morning")
+        {
+            setMode(morningMode, morningPhrase, "Changed to '${morningMode}' because of motion on '${evt.displayName}' motion sensor")
+        }
+        else if (timePeriod == "home")
+        {
+            setMode(homeMode, homePhrase)
+        }
+        else if (timePeriod == "night")
+        {
+            if (contactValue == "closed")
+            {
+			    if (location.mode != nightMode)
+                {
+                	setMode(oneUpMode, oneUpPhrase, "Changed to '${oneUpMode}' because of motion on '${evt.displayName}' motion sensor and the bedroom door was closed")	
+                }
+            }
+            else if (contactValue == "open")
+            {
+			    //setMode(homeMode, homePhrase)
+            }
+            else
+            {
+				log.error "nightMotionAction >> night:: contact value is '${contactValue}'"
+            }
+        }
+        else
+        {
+			log.error "nightMotionAction >> motion:: timePeriod is '${timePeriod}'"
+        }
+    }
+    else
+    {
+    	log.error "nightMotionAction >>:: motion sensor is '${evt.value}'"
+    }
+    
+    if (evt.value == "inactive")
+    {
+        state.nightMotionStoppedAt = now()
+    }
+    
+    runIn(30, checkMode)
+}
+
+def warningLightOff()
+{
+	log.trace "IN:: warningLightOff"
+    log.info "huePrev = ${state.huePrev}"
+    hues.setColor(state.huePrev)
+}
+
+def warningLightOn()
+{
+
+	log.trace "IN:: warningLightOn"
+    
+    if (!state.warningLight)
+    {
+    	state.huePrev = [switch: hues.currentValue("switch"), hue: hues.currentValue("hue"), saturation: hues.currentValue("saturation"), level: hues.currentValue("level")]
+        log.debug "new huePrev = ${state.huePrev}"
+    }
+    
+    def hueColor = 70
+	def saturation = 100
+
+	switch(color) {
+			case "White":
+				hueColor = 52
+				saturation = 19
+				break;
+			case "Daylight":
+				hueColor = 53
+				saturation = 91
+				break;
+			case "Soft White":
+				hueColor = 23
+				saturation = 56
+				break;
+			case "Warm White":
+				hueColor = 20
+				saturation = 80 //83
+				break;
+	 	 	case "Blue":
+				hueColor = 70
+				break;
+			case "Green":
+				hueColor = 39
+				break;
+			case "Yellow":
+				hueColor = 25
+				break;
+			case "Orange":
+				hueColor = 10
+				break;
+			case "Purple":
+				hueColor = 75
+				break;
+			case "Pink":
+				hueColor = 83
+				break;
+			case "Red":
+				hueColor = 100
+				break;
+	}
+
+	if (color != "On - Custom Color")
+    {
+        def newValue = [hue: hueColor, saturation: saturation, level: lightLevel as Integer ?: 100]
+        hues*.setColor(newValue)
+		log.debug "new value = $newValue"
+        
+    }
+    else
+    {
+    	hues*.on()
+    }
+    
+    state.warningLight = true
+
+}
